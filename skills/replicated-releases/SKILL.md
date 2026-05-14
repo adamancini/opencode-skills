@@ -2,6 +2,12 @@
 name: replicated-releases
 description: This skill should be used when the user asks to "create a Replicated release", "promote a release", "lint Replicated manifests", "package a Helm chart for Replicated", "manage release versions", or mentions Replicated release workflows, CI/CD pipelines, or semantic versioning for KOTS manifests.
 version: 0.3.0
+metadata:
+  author: adamancini
+  repository: https://github.com/adamancini/opencode-skills
+  tags: replicated,releases,helm,kots,ci-cd
+  globs: ""
+  alwaysApply: "false"
 ---
 
 # Replicated Releases

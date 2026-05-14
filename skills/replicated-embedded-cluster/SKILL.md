@@ -2,6 +2,12 @@
 name: replicated-embedded-cluster
 description: This skill should be used when the user asks to "install Embedded Cluster", "join a node to Embedded Cluster", "check Embedded Cluster status", "download the Embedded Cluster binary", or mentions Replicated Embedded Cluster, EC installation, or k0s controller status on CMX VMs.
 version: 0.3.0
+metadata:
+  author: adamancini
+  repository: https://github.com/adamancini/opencode-skills
+  tags: replicated,embedded-cluster,ec,k0s
+  globs: ""
+  alwaysApply: "false"
 ---
 
 # Replicated Embedded Cluster

@@ -2,6 +2,12 @@
 name: replicated-cmx-vms
 description: This skill should be used when the user asks to "create a CMX VM", "SSH to a CMX VM", "create a multi-node VM cluster", "execute commands on a CMX VM", "expose a VM port", "list CMX VMs", "clean up CMX VMs", or mentions Replicated Compatibility Matrix VMs, VM networking, or VM clusters for Embedded Cluster testing.
 version: 0.3.0
+metadata:
+  author: adamancini
+  repository: https://github.com/adamancini/opencode-skills
+  tags: replicated,cmx,vm,ssh,testing
+  globs: ""
+  alwaysApply: "false"
 ---
 
 # Replicated CMX VMs

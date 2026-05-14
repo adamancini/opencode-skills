@@ -2,6 +2,12 @@
 name: replicated-channels
 description: This skill should be used when the user asks to "list Replicated channels", "create a channel", "inspect a channel", "promote a release to a channel", or mentions Replicated channel management, deployment tracks, or channel strategy (stable, beta, unstable).
 version: 0.3.0
+metadata:
+  author: adamancini
+  repository: https://github.com/adamancini/opencode-skills
+  tags: replicated,channels,deployment
+  globs: ""
+  alwaysApply: "false"
 ---
 
 # Replicated Channels

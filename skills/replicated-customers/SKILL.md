@@ -2,6 +2,12 @@
 name: replicated-customers
 description: This skill should be used when the user asks to "list Replicated customers", "create a customer", "download a license", "inspect a customer", "view customer instances", or mentions Replicated customer management, license files, or entitlements.
 version: 0.3.0
+metadata:
+  author: adamancini
+  repository: https://github.com/adamancini/opencode-skills
+  tags: replicated,customers,licenses
+  globs: ""
+  alwaysApply: "false"
 ---
 
 # Replicated Customers

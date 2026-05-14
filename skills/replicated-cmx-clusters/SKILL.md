@@ -2,6 +2,12 @@
 name: replicated-cmx-clusters
 description: This skill should be used when the user asks to "create a CMX cluster", "create an EKS cluster", "create a GKE cluster", "list CMX clusters", "get kubeconfig from CMX", "open a CMX cluster shell", or mentions Replicated Compatibility Matrix cloud clusters, managed Kubernetes testing, or kubectl against CMX.
 version: 0.3.0
+metadata:
+  author: adamancini
+  repository: https://github.com/adamancini/opencode-skills
+  tags: replicated,cmx,clusters,eks,gke,aks,kubernetes
+  globs: ""
+  alwaysApply: "false"
 ---
 
 # Replicated CMX Clusters
