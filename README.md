@@ -10,13 +10,17 @@ These skills are organized by **common action**, not by product, following the p
 
 | Skill | Trigger | What it covers |
 |-------|---------|----------------|
-| `replicated-releases` | "create a release", "promote a release", "lint manifests", "package a Helm chart" | Release lifecycle, versioning, CI/CD, Makefiles |
-| `replicated-channels` | "list channels", "create a channel", "channel strategy" | Channel management, deployment tracks, promotion workflows |
-| `replicated-customers` | "list customers", "create a customer", "download a license" | Customer management, licenses, entitlements, instances |
-| `replicated-cmx-clusters` | "create a CMX cluster", "EKS cluster", "get kubeconfig" | Cloud-provider Kubernetes (EKS, GKE, AKS, kind, k3s) |
-| `replicated-cmx-vms` | "create a CMX VM", "SSH to a VM", "multi-node cluster", "expose a port" | VM creation, multi-node networking, SSH, remote execution, cleanup |
-| `replicated-embedded-cluster` | "install Embedded Cluster", "join a node", "EC status" | EC binary download, installation, node joining, verification |
 | `replicated-api` | "make an API call", "Vendor API", "query the API" | Ad-hoc GET/POST/PUT/PATCH to the Vendor API v3, `jq` filtering, scripting |
+| `replicated-channels` | "list channels", "create a channel", "channel strategy" | Channel management, deployment tracks, promotion workflows |
+| `replicated-config` | "initialize config", "setup .replicated config" | Project configuration, auto-detecting Helm charts and preflight specs |
+| `replicated-cmx-clusters` | "create a CMX cluster", "EKS cluster", "get kubeconfig" | Cloud-provider Kubernetes (EKS, GKE, AKS, kind, k3s) |
+| `replicated-cmx-networks` | "list CMX networks", "network ls", "network update" | CMX test networks, airgap policies, network reports |
+| `replicated-cmx-vms` | "create a CMX VM", "SSH to a VM", "multi-node cluster", "expose a port" | VM creation, multi-node networking, SSH, remote execution, cleanup |
+| `replicated-customers` | "list customers", "create a customer", "download a license", "list instances", "tag an instance" | Customer management, licenses, entitlements, instance tracking |
+| `replicated-embedded-cluster` | "install Embedded Cluster", "join a node", "EC status" | EC binary download, installation, node joining, verification |
+| `replicated-profiles` | "manage profiles", "add a profile", "switch profiles", "list policies", "create a policy" | Authentication profiles, RBAC policies, credentials management |
+| `replicated-registries` | "add a registry", "list registries", "test a registry", "DockerHub", "ECR" | Private registry management, proxy registry connections |
+| `replicated-releases` | "create a release", "promote a release", "lint manifests", "list apps", "set default app" | Release lifecycle, app management, versioning, CI/CD, defaults |
 
 ## Authentication
 

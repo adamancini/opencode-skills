@@ -290,6 +290,64 @@ replicated release create \
 - Include release notes with every release
 - Document breaking changes clearly
 
+## App Management
+
+Create and manage Replicated applications.
+
+### List Applications
+
+```bash
+replicated app ls
+replicated app ls --output json
+```
+
+### Create an Application
+
+```bash
+replicated app create "My New App"
+replicated app create "My New App" --output json
+```
+
+### Remove an Application
+
+```bash
+replicated app rm <app-slug>
+```
+
+### List Custom Hostnames
+
+```bash
+replicated app hostname ls <app-slug>
+```
+
+## Default Values
+
+Set default values used by other commands.
+
+### Set Default App
+
+```bash
+replicated default set app <app-slug>
+```
+
+### Show Default Values
+
+```bash
+replicated default show
+```
+
+### Clear a Default
+
+```bash
+replicated default clear app
+```
+
+### Clear All Defaults
+
+```bash
+replicated default clear-all
+```
+
 ## Troubleshooting
 
 | Problem | Fix |

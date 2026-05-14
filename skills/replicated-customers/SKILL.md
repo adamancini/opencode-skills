@@ -1,6 +1,6 @@
 ---
 name: replicated-customers
-description: This skill should be used when the user asks to "list Replicated customers", "create a customer", "download a license", "inspect a customer", "view customer instances", or mentions Replicated customer management, license files, or entitlements.
+description: This skill should be used when the user asks to "list Replicated customers", "create a customer", "download a license", "inspect a customer", "view customer instances", "list instances", "inspect an instance", "tag an instance", or mentions Replicated customer management, license files, entitlements, or instance management.
 version: 0.3.0
 metadata:
   author: adamancini
@@ -109,6 +109,35 @@ Track release adoption via the vendor portal:
 - Set appropriate expiration for `trial` licenses
 - Associate customers with the correct channel
 - Download and version-control license files for CI/CD
+
+## Instance Management
+
+Track and manage customer installations.
+
+### List Instances
+
+```bash
+# All instances for an app
+replicated instance ls --app <app-slug>
+
+# Instances for a specific customer
+replicated instance ls --app <app-slug> --customer <customer-id>
+
+# Filter by tag
+replicated instance ls --app <app-slug> --tag environment=prod
+```
+
+### Inspect an Instance
+
+```bash
+replicated instance inspect --app <app-slug> --instance <instance-id>
+```
+
+### Tag an Instance
+
+```bash
+replicated instance tag --app <app-slug> --instance <instance-id> --tag key=value
+```
 
 ## Troubleshooting
 
