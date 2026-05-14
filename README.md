@@ -16,6 +16,7 @@ These skills are organized by **common action**, not by product, following the p
 | `replicated-cmx-clusters` | "create a CMX cluster", "EKS cluster", "get kubeconfig" | Cloud-provider Kubernetes (EKS, GKE, AKS, kind, k3s) |
 | `replicated-cmx-vms` | "create a CMX VM", "SSH to a VM", "multi-node cluster", "expose a port" | VM creation, multi-node networking, SSH, remote execution, cleanup |
 | `replicated-embedded-cluster` | "install Embedded Cluster", "join a node", "EC status" | EC binary download, installation, node joining, verification |
+| `replicated-api` | "make an API call", "Vendor API", "query the API" | Ad-hoc GET/POST/PUT/PATCH to the Vendor API v3, `jq` filtering, scripting |
 
 ## Authentication
 
