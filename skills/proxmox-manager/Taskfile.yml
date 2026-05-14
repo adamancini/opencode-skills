@@ -1,0 +1,1188 @@
+version: '3'
+
+vars:
+  SKILL_DIR:
+    sh: 'dirname "{{.TASKFILE}}"'
+  # Read cluster configuration from cluster-config.yaml instead of hardcoding
+  _CFG_PASS_PATH:
+    sh: 'yq -r ".credentials.pass_path" "$(dirname "{{.TASKFILE}}")/cluster-config.yaml"'
+  DOMAIN:
+    sh: 'yq -r ".cluster.name" "$(dirname "{{.TASKFILE}}")/cluster-config.yaml"'
+  _CFG_DEFAULT_NODE:
+    sh: 'yq -r ".cluster.nodes[0].name" "$(dirname "{{.TASKFILE}}")/cluster-config.yaml"'
+  _CFG_DEFAULT_STORAGE:
+    sh: 'yq -r ".defaults.storage" "$(dirname "{{.TASKFILE}}")/cluster-config.yaml"'
+  PVE_AUTH: 'PVEAPIToken=$(pass show {{._CFG_PASS_PATH}} | head -1)=$(pass show {{._CFG_PASS_PATH}} | tail -1)'
+  PVE_NODE: '{{if .PVE_NODE}}{{.PVE_NODE}}{{else}}{{._CFG_DEFAULT_NODE}}{{end}}'
+  PVE_HOST: '{{.PVE_NODE}}.{{.DOMAIN}}'
+  PVE_API: 'https://{{.PVE_HOST}}:8006/api2/json'
+  STORAGE: '{{if .STORAGE}}{{.STORAGE}}{{else}}{{._CFG_DEFAULT_STORAGE}}{{end}}'
+  # DRY helper: base command for resolving a VM's current node from the cluster API.
+  # Usage in tasks: VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == XXXX) | .node')
+  _RESOLVE_NODE: 'curl -sk -H "Authorization: {{.PVE_AUTH}}" "{{.PVE_API}}/cluster/resources?type=vm" | jq -r'
+
+tasks:
+  default:
+    desc: List all available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  pve:check:
+    desc: Verify API connectivity to all cluster nodes
+    silent: true
+    cmds:
+      - |
+        NODES=$(yq -r '.cluster.nodes[].name' "{{.SKILL_DIR}}/cluster-config.yaml")
+        for node in $NODES; do
+          code=$(curl -sk -o /dev/null -w "%{http_code}" \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            "https://$node.{{.DOMAIN}}:8006/api2/json/version")
+          printf "%-8s %s\n" "$node" "$code"
+        done
+
+  # ---------------------------------------------------------------------------
+  # Status
+  # ---------------------------------------------------------------------------
+
+  pve:status:
+    desc: Show cluster health (nodes, online status, quorum)
+    silent: true
+    cmds:
+      - |
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/status" \
+          | jq -r '
+            ["NAME","TYPE","ONLINE"],
+            ["----","----","------"],
+            (.data[] | [.name, .type, (.online // "" | tostring)]) | @tsv' \
+          | column -t
+
+  pve:status:node:
+    desc: Show per-node resource usage
+    silent: true
+    requires:
+      vars: [NODE]
+    cmds:
+      - |
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "https://{{.NODE}}.{{.DOMAIN}}:8006/api2/json/nodes/{{.NODE}}/status" \
+          | jq '{
+              cpu_pct: (.data.cpu * 100 | floor | tostring + "%"),
+              memory_used_gb: (.data.memory.used / 1073741824 * 10 | floor / 10 | tostring + "G"),
+              memory_total_gb: (.data.memory.total / 1073741824 * 10 | floor / 10 | tostring + "G"),
+              uptime_hours: (.data.uptime / 3600 | floor)
+            }'
+
+  pve:vms:
+    desc: List all VMs across the cluster (tabular)
+    silent: true
+    cmds:
+      - |
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r '
+            ["VMID","NAME","STATUS","NODE","MEM","TAGS"],
+            ["----","----","------","----","---","----"],
+            (.data | sort_by(.vmid)[] | select(.template != 1) |
+              [.vmid, .name, .status, .node,
+               (.maxmem / 1073741824 | floor | tostring + "G"),
+               (.tags // "-")]) | @tsv' \
+          | column -t
+
+  pve:vms:running:
+    desc: List running VMs only
+    silent: true
+    cmds:
+      - |
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r '
+            ["VMID","NAME","NODE","MEM","TAGS"],
+            ["----","----","----","---","----"],
+            (.data | sort_by(.vmid)[] | select(.status == "running") | select(.template != 1) |
+              [.vmid, .name, .node,
+               (.maxmem / 1073741824 | floor | tostring + "G"),
+               (.tags // "-")]) | @tsv' \
+          | column -t
+
+  pve:vms:by-tag:
+    desc: List VMs matching a tag
+    silent: true
+    requires:
+      vars: [TAG]
+    cmds:
+      - |
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r --arg tag "{{.TAG}}" '
+            ["VMID","NAME","STATUS","NODE","TAGS"],
+            ["----","----","------","----","----"],
+            (.data | sort_by(.vmid)[] | select(.template != 1) |
+              select(.tags // "" | split(";") | any(. == $tag)) |
+              [.vmid, .name, .status, .node, .tags]) | @tsv' \
+          | column -t
+
+  pve:templates:
+    desc: List VM templates
+    silent: true
+    cmds:
+      - |
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r '
+            ["VMID","NAME","NODE","TAGS"],
+            ["----","----","----","----"],
+            (.data | sort_by(.vmid)[] | select(.template == 1) |
+              [.vmid, .name, .node, (.tags // "-")]) | @tsv' \
+          | column -t
+
+  # ---------------------------------------------------------------------------
+  # VM Lifecycle
+  # ---------------------------------------------------------------------------
+
+  pve:vm:clone:
+    desc: Clone a template (always same-node; migrate after if needed)
+    silent: true
+    requires:
+      vars: [TEMPLATE, VMID, NAME]
+    cmds:
+      - |
+        # Resolve which node the template lives on
+        TMPL_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.TEMPLATE}}) | .node')
+        [ -z "$TMPL_NODE" ] || [ "$TMPL_NODE" = "null" ] && echo "Template {{.TEMPLATE}} not found" && exit 1
+
+        echo "Cloning template {{.TEMPLATE}} -> VMID {{.VMID}} ({{.NAME}}) on $TMPL_NODE..."
+        curl -sk -X POST \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          -d "newid={{.VMID}}&name={{.NAME}}&full=1&storage={{.STORAGE}}" \
+          "https://$TMPL_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$TMPL_NODE/qemu/{{.TEMPLATE}}/clone" \
+          | jq -r '.data // "ERROR: no task returned"'
+
+  pve:vm:start:
+    desc: Start a VM
+    silent: true
+    requires:
+      vars: [VMID]
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        echo "Starting VMID {{.VMID}} on $VM_NODE..."
+        curl -sk -X POST \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/status/start" \
+          | jq -r '.data // "ERROR: no task returned"'
+
+  pve:vm:stop:
+    desc: Graceful ACPI shutdown of a VM
+    silent: true
+    requires:
+      vars: [VMID]
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        echo "Shutting down VMID {{.VMID}} on $VM_NODE (ACPI)..."
+        curl -sk -X POST \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/status/shutdown" \
+          | jq -r '.data // "ERROR: no task returned"'
+
+  pve:vm:kill:
+    desc: Force-stop a VM (immediate power off)
+    silent: true
+    requires:
+      vars: [VMID]
+    prompt: "Force-stop VMID {{.VMID}}?"
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        echo "Force-stopping VMID {{.VMID}} on $VM_NODE..."
+        curl -sk -X POST \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/status/stop" \
+          | jq -r '.data // "ERROR: no task returned"'
+
+  pve:vm:delete:
+    desc: Delete a VM and all its disks (auto-stops if running)
+    silent: true
+    requires:
+      vars: [VMID]
+    prompt: "PERMANENTLY DELETE VMID {{.VMID}} and all its disks?"
+    cmds:
+      - |
+        VM_INFO=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | "\(.node) \(.status)"')
+        VM_NODE=$(echo "$VM_INFO" | awk '{print $1}')
+        VM_STATUS=$(echo "$VM_INFO" | awk '{print $2}')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        # Auto-stop if running
+        if [ "$VM_STATUS" = "running" ]; then
+          echo "VM is running -- stopping first..."
+          curl -sk -X POST \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/status/stop" > /dev/null
+          echo "Waiting for VM to stop..."
+          for i in $(seq 1 30); do
+            sleep 2
+            status=$(curl -sk \
+              -H "Authorization: {{.PVE_AUTH}}" \
+              "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/status/current" \
+              | jq -r '.data.status')
+            [ "$status" = "stopped" ] && break
+          done
+        fi
+
+        echo "Deleting VMID {{.VMID}} on $VM_NODE..."
+        curl -sk -X DELETE \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}?purge=1&destroy-unreferenced-disks=1" \
+          | jq -r '.data // "ERROR: no task returned"'
+
+  pve:vm:resize:
+    desc: Grow a VM disk
+    silent: true
+    requires:
+      vars: [VMID, SIZE]
+    vars:
+      DISK: '{{.DISK | default "scsi0"}}'
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        echo "Resizing VMID {{.VMID}} disk {{.DISK}} by {{.SIZE}} on $VM_NODE..."
+        curl -sk -X PUT \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          -d "disk={{.DISK}}&size={{.SIZE}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/resize" \
+          | jq '.'
+
+  pve:vm:config:
+    desc: Show VM configuration
+    silent: true
+    requires:
+      vars: [VMID]
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/config" \
+          | jq '.data'
+
+  pve:vm:set:
+    desc: Set VM configuration (CORES, MEMORY, TAGS, IP)
+    silent: true
+    requires:
+      vars: [VMID]
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        # Build an array of --data-urlencode args to handle special chars
+        # (semicolons in tags, slashes/commas in ipconfig0)
+        ARGS=()
+        DESC=""
+        {{if .CORES}}ARGS+=(--data-urlencode "cores={{.CORES}}"); DESC="${DESC} cores={{.CORES}}"{{end}}
+        {{if .MEMORY}}ARGS+=(--data-urlencode "memory={{.MEMORY}}"); DESC="${DESC} memory={{.MEMORY}}"{{end}}
+        {{if .TAGS}}ARGS+=(--data-urlencode "tags={{.TAGS}}"); DESC="${DESC} tags={{.TAGS}}"{{end}}
+        {{if .IP}}
+        # Derive gateway as .1 of the subnet (strip CIDR suffix, replace last octet)
+        GW=$(echo "{{.IP}}" | sed 's|\.[0-9]*/.*|.1|')
+        ARGS+=(--data-urlencode "ipconfig0=ip={{.IP}},gw=${GW}")
+        DESC="${DESC} ip={{.IP}},gw=${GW}"
+        {{end}}
+
+        if [ ${#ARGS[@]} -eq 0 ]; then
+          echo "No configuration parameters specified. Use CORES, MEMORY, TAGS, or IP."
+          exit 1
+        fi
+
+        echo "Setting config on VMID {{.VMID}} ($VM_NODE):${DESC}"
+        curl -sk -X PUT \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "${ARGS[@]}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/config" \
+          | jq '.'
+
+  pve:vm:migrate:
+    desc: Migrate a VM to another node
+    silent: true
+    requires:
+      vars: [VMID, TARGET]
+    vars:
+      ONLINE: '{{.ONLINE | default "0"}}'
+    cmds:
+      - |
+        VM_NODE=$({{._RESOLVE_NODE}} '.data[] | select(.vmid == {{.VMID}}) | .node')
+        [ -z "$VM_NODE" ] || [ "$VM_NODE" = "null" ] && echo "VMID {{.VMID}} not found" && exit 1
+
+        if [ "$VM_NODE" = "{{.TARGET}}" ]; then
+          echo "VMID {{.VMID}} is already on {{.TARGET}}"
+          exit 0
+        fi
+
+        echo "Migrating VMID {{.VMID}} from $VM_NODE -> {{.TARGET}} (online={{.ONLINE}})..."
+        curl -sk -X POST \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          -d "target={{.TARGET}}&online={{.ONLINE}}" \
+          "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/{{.VMID}}/migrate" \
+          | jq -r '.data // "ERROR: no task returned"'
+
+  pve:task:wait:
+    desc: Poll a task UPID until completion
+    silent: true
+    requires:
+      vars: [UPID, NODE]
+    vars:
+      TIMEOUT: '{{.TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        echo "Waiting for task on {{.NODE}} (timeout: {{.TIMEOUT}}s)..."
+        ELAPSED=0
+        INTERVAL=3
+        while true; do
+          if [ "$ELAPSED" -ge "{{.TIMEOUT}}" ]; then
+            echo ""
+            echo "ERROR: Timed out after {{.TIMEOUT}}s waiting for task on {{.NODE}}"
+            exit 1
+          fi
+          RESULT=$(curl -sk \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            "https://{{.NODE}}.{{.DOMAIN}}:8006/api2/json/nodes/{{.NODE}}/tasks/{{.UPID}}/status" \
+            | jq -r '.data | "\(.status) \(.exitstatus // "")"')
+          STATUS=$(echo "$RESULT" | awk '{print $1}')
+          EXIT=$(echo "$RESULT" | awk '{print $2}')
+          if [ "$STATUS" = "stopped" ]; then
+            if [ "$EXIT" = "OK" ]; then
+              echo ""
+              echo "Task completed successfully"
+            else
+              echo ""
+              echo "Task failed: $EXIT"
+              exit 1
+            fi
+            break
+          fi
+          printf "."
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+
+  # ---------------------------------------------------------------------------
+  # Cluster Lifecycle
+  # ---------------------------------------------------------------------------
+
+  pve:cluster:list:
+    desc: List available cluster profiles
+    silent: true
+    cmds:
+      - |
+        echo "Available cluster profiles:"
+        echo ""
+        for f in {{.SKILL_DIR}}/clusters/*.yaml; do
+          name=$(yq '.name' "$f")
+          type=$(yq '.type' "$f")
+          cp_count=$(yq '.nodes.controlplane.count' "$f")
+          w_count=$(yq '.nodes.workers.count' "$f")
+          tags=$(yq '.tags | join(", ")' "$f")
+          printf "  %-20s type=%-8s cp=%s w=%s  tags=[%s]\n" "$name" "$type" "$cp_count" "$w_count" "$tags"
+        done
+
+  pve:cluster:validate:
+    desc: Validate a cluster profile YAML against cluster-config.yaml conventions
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        CFG_FILE="{{.SKILL_DIR}}/cluster-config.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        ERRORS=0
+        WARNINGS=0
+
+        echo "Validating profile: {{.PROFILE}}"
+        echo "======================================="
+
+        # --- Required fields ---
+        echo ""
+        echo "=== Required Fields ==="
+        for field in name type template tags; do
+          val=$(yq ".$field" "$PROFILE_FILE")
+          if [ "$val" = "null" ] || [ -z "$val" ]; then
+            echo "  FAIL: Missing required field: $field"
+            ERRORS=$((ERRORS + 1))
+          else
+            echo "  OK:   $field = $val"
+          fi
+        done
+
+        # Check nodes.controlplane exists and has assignments
+        cp_count=$(yq '.nodes.controlplane.count // 0' "$PROFILE_FILE")
+        cp_assignments=$(yq '.nodes.controlplane.assignments | length' "$PROFILE_FILE")
+        if [ "$cp_count" = "0" ] || [ "$cp_count" = "null" ]; then
+          echo "  FAIL: nodes.controlplane.count must be > 0"
+          ERRORS=$((ERRORS + 1))
+        else
+          echo "  OK:   nodes.controlplane.count = $cp_count"
+        fi
+        if [ "$cp_assignments" -lt "$cp_count" ] 2>/dev/null; then
+          echo "  FAIL: nodes.controlplane.assignments has $cp_assignments entries but count is $cp_count"
+          ERRORS=$((ERRORS + 1))
+        fi
+
+        # --- VMID range validation ---
+        echo ""
+        echo "=== VMID Range Validation ==="
+        VM_RANGE=$(yq -r '.vmid_ranges.vms' "$CFG_FILE")
+        RANGE_MIN=$(echo "$VM_RANGE" | cut -d- -f1)
+        RANGE_MAX=$(echo "$VM_RANGE" | cut -d- -f2)
+        echo "  Allowed VM range: $RANGE_MIN - $RANGE_MAX"
+
+        ALL_VMIDS=""
+        # Collect controlplane VMIDs
+        for i in $(seq 0 $((cp_count - 1))); do
+          vmid=$(yq ".nodes.controlplane.assignments[$i].vmid" "$PROFILE_FILE")
+          if [ "$vmid" != "null" ] && [ -n "$vmid" ]; then
+            ALL_VMIDS="$ALL_VMIDS $vmid"
+            if [ "$vmid" -lt "$RANGE_MIN" ] || [ "$vmid" -gt "$RANGE_MAX" ]; then
+              echo "  FAIL: Controlplane VMID $vmid is outside allowed range ($RANGE_MIN-$RANGE_MAX)"
+              ERRORS=$((ERRORS + 1))
+            else
+              echo "  OK:   Controlplane VMID $vmid is within range"
+            fi
+          fi
+        done
+        # Collect worker VMIDs
+        w_count=$(yq '.nodes.workers.count // 0' "$PROFILE_FILE")
+        for i in $(seq 0 $((w_count - 1))); do
+          vmid=$(yq ".nodes.workers.assignments[$i].vmid" "$PROFILE_FILE")
+          if [ "$vmid" != "null" ] && [ -n "$vmid" ]; then
+            ALL_VMIDS="$ALL_VMIDS $vmid"
+            if [ "$vmid" -lt "$RANGE_MIN" ] || [ "$vmid" -gt "$RANGE_MAX" ]; then
+              echo "  FAIL: Worker VMID $vmid is outside allowed range ($RANGE_MIN-$RANGE_MAX)"
+              ERRORS=$((ERRORS + 1))
+            else
+              echo "  OK:   Worker VMID $vmid is within range"
+            fi
+          fi
+        done
+
+        # --- Duplicate VMID check ---
+        echo ""
+        echo "=== Duplicate VMID Check ==="
+        DUPES=$(echo "$ALL_VMIDS" | tr ' ' '\n' | sort | uniq -d | grep -v '^$')
+        if [ -n "$DUPES" ]; then
+          for d in $DUPES; do
+            echo "  FAIL: Duplicate VMID: $d"
+            ERRORS=$((ERRORS + 1))
+          done
+        else
+          echo "  OK:   No duplicate VMIDs"
+        fi
+
+        # --- Node name validation ---
+        echo ""
+        echo "=== Node Assignment Validation ==="
+        VALID_NODES=$(yq -r '.cluster.nodes[].name' "$CFG_FILE")
+        for i in $(seq 0 $((cp_count - 1))); do
+          node=$(yq ".nodes.controlplane.assignments[$i].node" "$PROFILE_FILE")
+          if [ "$node" != "null" ] && [ -n "$node" ]; then
+            if echo "$VALID_NODES" | grep -qx "$node"; then
+              echo "  OK:   Controlplane assignment [$i] -> $node"
+            else
+              echo "  FAIL: Controlplane assignment [$i] references unknown node '$node'"
+              echo "        Valid nodes: $(echo $VALID_NODES | tr '\n' ' ')"
+              ERRORS=$((ERRORS + 1))
+            fi
+          fi
+        done
+        for i in $(seq 0 $((w_count - 1))); do
+          node=$(yq ".nodes.workers.assignments[$i].node" "$PROFILE_FILE")
+          if [ "$node" != "null" ] && [ -n "$node" ]; then
+            if echo "$VALID_NODES" | grep -qx "$node"; then
+              echo "  OK:   Worker assignment [$i] -> $node"
+            else
+              echo "  FAIL: Worker assignment [$i] references unknown node '$node'"
+              echo "        Valid nodes: $(echo $VALID_NODES | tr '\n' ' ')"
+              ERRORS=$((ERRORS + 1))
+            fi
+          fi
+        done
+
+        # --- Template VMID exists (API check) ---
+        echo ""
+        echo "=== Template Existence Check ==="
+        TEMPLATE=$(yq '.template' "$PROFILE_FILE")
+        TMPL_NODE=$({{._RESOLVE_NODE}} ".data[] | select(.vmid == $TEMPLATE) | .node")
+        if [ -z "$TMPL_NODE" ] || [ "$TMPL_NODE" = "null" ]; then
+          echo "  FAIL: Template VMID $TEMPLATE not found in the cluster"
+          ERRORS=$((ERRORS + 1))
+        else
+          echo "  OK:   Template VMID $TEMPLATE exists on node $TMPL_NODE"
+        fi
+
+        # --- Summary ---
+        echo ""
+        echo "======================================="
+        if [ "$ERRORS" -gt 0 ]; then
+          echo "VALIDATION FAILED: $ERRORS error(s)"
+          exit 1
+        else
+          echo "VALIDATION PASSED: Profile '{{.PROFILE}}' is valid"
+        fi
+
+  pve:cluster:status:
+    desc: Show VMs belonging to a cluster profile
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        # Build jq filter for AND-matching all profile tags
+        TAGS=$(yq -r '.tags[]' "$PROFILE_FILE")
+        JQ_FILTER='select(.template != 1)'
+        for tag in $TAGS; do
+          JQ_FILTER="$JQ_FILTER | select(.tags // \"\" | split(\";\") | any(. == \"$tag\"))"
+        done
+
+        echo "VMs matching profile {{.PROFILE}}:"
+        echo ""
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r "
+            [\"VMID\",\"NAME\",\"STATUS\",\"NODE\",\"MEM\",\"TAGS\"],
+            [\"----\",\"----\",\"------\",\"----\",\"---\",\"----\"],
+            (.data | sort_by(.vmid)[] | ${JQ_FILTER} |
+              [.vmid, .name, .status, .node,
+               (.maxmem / 1073741824 | floor | tostring + \"G\"),
+               .tags]) | @tsv" \
+          | column -t
+
+  pve:cluster:create:
+    desc: Provision a cluster from a profile (clone, configure, migrate, resize, start)
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        TEMPLATE=$(yq '.template' "$PROFILE_FILE")
+        TAGS_CSV=$(yq '.tags | join(";")' "$PROFILE_FILE")
+        DISK_SIZE=$(yq '.nodes.controlplane.disk' "$PROFILE_FILE")
+        CORES=$(yq '.nodes.controlplane.cores' "$PROFILE_FILE")
+        MEMORY=$(yq '.nodes.controlplane.memory' "$PROFILE_FILE")
+
+        # Resolve template node
+        TMPL_NODE=$({{._RESOLVE_NODE}} ".data[] | select(.vmid == $TEMPLATE) | .node")
+        [ -z "$TMPL_NODE" ] || [ "$TMPL_NODE" = "null" ] && echo "Template $TEMPLATE not found" && exit 1
+        echo "Template $TEMPLATE is on $TMPL_NODE"
+
+        # Read assignments
+        CP_COUNT=$(yq '.nodes.controlplane.count' "$PROFILE_FILE")
+        echo ""
+        echo "=== Phase 1: Clone ==="
+        for i in $(seq 0 $((CP_COUNT - 1))); do
+          NAME=$(yq ".nodes.controlplane.assignments[$i].name" "$PROFILE_FILE")
+          VMID=$(yq ".nodes.controlplane.assignments[$i].vmid" "$PROFILE_FILE")
+          TARGET=$(yq ".nodes.controlplane.assignments[$i].node" "$PROFILE_FILE")
+          IP=$(yq ".nodes.controlplane.assignments[$i].ip" "$PROFILE_FILE")
+
+          echo "Cloning $TEMPLATE -> $VMID ($NAME) on $TMPL_NODE..."
+          UPID=$(curl -sk -X POST \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            -d "newid=$VMID&name=$NAME&full=1&storage={{.STORAGE}}" \
+            "https://$TMPL_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$TMPL_NODE/qemu/$TEMPLATE/clone" \
+            | jq -r '.data // ""')
+          [ -z "$UPID" ] && echo "  ERROR: clone returned no UPID" && continue
+
+          # Wait for clone
+          while true; do
+            STATUS=$(curl -sk \
+              -H "Authorization: {{.PVE_AUTH}}" \
+              "https://$TMPL_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$TMPL_NODE/tasks/$UPID/status" \
+              | jq -r '.data.status')
+            [ "$STATUS" = "stopped" ] && break
+            sleep 3
+          done
+          echo "  Clone complete: $NAME ($VMID)"
+        done
+
+        echo ""
+        echo "=== Phase 2: Configure ==="
+        for i in $(seq 0 $((CP_COUNT - 1))); do
+          NAME=$(yq ".nodes.controlplane.assignments[$i].name" "$PROFILE_FILE")
+          VMID=$(yq ".nodes.controlplane.assignments[$i].vmid" "$PROFILE_FILE")
+          IP=$(yq ".nodes.controlplane.assignments[$i].ip" "$PROFILE_FILE")
+
+          # Build tag string: profile tags + controlplane role
+          VM_TAGS="${TAGS_CSV};controlplane"
+
+          # Derive gateway from IP (assume /24, gateway is .1)
+          GW=$(echo "$IP" | sed 's/\.[0-9]*$/.1/')
+
+          echo "Configuring $NAME ($VMID): ${CORES}c/${MEMORY}M, tags=$VM_TAGS..."
+          curl -sk -X PUT \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            --data-urlencode "cores=$CORES" \
+            --data-urlencode "memory=$MEMORY" \
+            --data-urlencode "tags=$VM_TAGS" \
+            "https://$TMPL_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$TMPL_NODE/qemu/$VMID/config" > /dev/null
+        done
+
+        echo ""
+        echo "=== Phase 3: Migrate ==="
+        for i in $(seq 0 $((CP_COUNT - 1))); do
+          NAME=$(yq ".nodes.controlplane.assignments[$i].name" "$PROFILE_FILE")
+          VMID=$(yq ".nodes.controlplane.assignments[$i].vmid" "$PROFILE_FILE")
+          TARGET=$(yq ".nodes.controlplane.assignments[$i].node" "$PROFILE_FILE")
+
+          if [ "$TARGET" = "$TMPL_NODE" ]; then
+            echo "$NAME ($VMID) already on $TARGET -- skipping migration"
+            continue
+          fi
+
+          echo "Migrating $NAME ($VMID) from $TMPL_NODE -> $TARGET..."
+          UPID=$(curl -sk -X POST \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            -d "target=$TARGET&online=0" \
+            "https://$TMPL_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$TMPL_NODE/qemu/$VMID/migrate" \
+            | jq -r '.data // ""')
+          [ -z "$UPID" ] && echo "  ERROR: migrate returned no UPID" && continue
+
+          # Wait for migration
+          while true; do
+            STATUS=$(curl -sk \
+              -H "Authorization: {{.PVE_AUTH}}" \
+              "https://$TMPL_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$TMPL_NODE/tasks/$UPID/status" \
+              | jq -r '.data.status')
+            [ "$STATUS" = "stopped" ] && break
+            sleep 5
+          done
+          echo "  Migration complete: $NAME -> $TARGET"
+        done
+
+        echo ""
+        echo "=== Phase 4: Resize disks ==="
+        for i in $(seq 0 $((CP_COUNT - 1))); do
+          NAME=$(yq ".nodes.controlplane.assignments[$i].name" "$PROFILE_FILE")
+          VMID=$(yq ".nodes.controlplane.assignments[$i].vmid" "$PROFILE_FILE")
+
+          # Re-resolve node after migration
+          VM_NODE=$({{._RESOLVE_NODE}} ".data[] | select(.vmid == $VMID) | .node")
+
+          echo "Resizing $NAME ($VMID) disk to $DISK_SIZE on $VM_NODE..."
+          curl -sk -X PUT \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            -d "disk=scsi0&size=$DISK_SIZE" \
+            "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/$VMID/resize" > /dev/null
+        done
+
+        echo ""
+        echo "=== Phase 5: Start ==="
+        for i in $(seq 0 $((CP_COUNT - 1))); do
+          NAME=$(yq ".nodes.controlplane.assignments[$i].name" "$PROFILE_FILE")
+          VMID=$(yq ".nodes.controlplane.assignments[$i].vmid" "$PROFILE_FILE")
+
+          VM_NODE=$({{._RESOLVE_NODE}} ".data[] | select(.vmid == $VMID) | .node")
+
+          echo "Starting $NAME ($VMID) on $VM_NODE..."
+          curl -sk -X POST \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            "https://$VM_NODE.{{.DOMAIN}}:8006/api2/json/nodes/$VM_NODE/qemu/$VMID/status/start" > /dev/null
+        done
+
+        echo ""
+        echo "=== Summary ==="
+        sleep 3
+        curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r --arg tags "$TAGS_CSV" '
+            ($tags | split(";")) as $required |
+            ["VMID","NAME","STATUS","NODE","MEM"],
+            ["----","----","------","----","---"],
+            (.data | sort_by(.vmid)[] | select(.template != 1) |
+              select((.tags // "" | split(";")) as $t | ($required | all(. as $r | $r | IN($t[])))) |
+              [.vmid, .name, .status, .node,
+               (.maxmem / 1073741824 | floor | tostring + "G")]) | @tsv' \
+          | column -t
+
+  pve:cluster:teardown:
+    desc: Destroy all VMs belonging to a cluster profile
+    silent: true
+    requires:
+      vars: [PROFILE]
+    prompt: "This will PERMANENTLY DELETE all VMs matching the profile tags. Continue?"
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        TAGS=$(yq -r '.tags[]' "$PROFILE_FILE")
+
+        # Build jq filter for AND-matching all profile tags
+        JQ_SELECT='select(.template != 1)'
+        for tag in $TAGS; do
+          JQ_SELECT="$JQ_SELECT | select(.tags // \"\" | split(\";\") | any(. == \"$tag\"))"
+        done
+
+        # Get matching VMs
+        VMS=$(curl -sk \
+          -H "Authorization: {{.PVE_AUTH}}" \
+          "{{.PVE_API}}/cluster/resources?type=vm" \
+          | jq -r ".data[] | ${JQ_SELECT} | \"\(.node) \(.vmid) \(.name) \(.status)\"")
+
+        if [ -z "$VMS" ]; then
+          echo "No VMs found matching profile {{.PROFILE}}"
+          exit 0
+        fi
+
+        echo "VMs to destroy:"
+        echo "$VMS" | while read node vmid name status; do
+          printf "  %-8s VMID=%-6s %-20s %s\n" "$node" "$vmid" "$name" "$status"
+        done
+        echo ""
+
+        # Shutdown running VMs
+        echo "=== Shutting down running VMs ==="
+        echo "$VMS" | while read node vmid name status; do
+          if [ "$status" = "running" ]; then
+            echo "  Stopping $name ($vmid) on $node..."
+            curl -sk -X POST \
+              -H "Authorization: {{.PVE_AUTH}}" \
+              "https://$node.{{.DOMAIN}}:8006/api2/json/nodes/$node/qemu/$vmid/status/stop" > /dev/null
+          fi
+        done
+
+        # Wait for all to stop (use temp file to propagate status out of pipe subshell)
+        echo "  Waiting for VMs to stop..."
+        STOP_STATUS=$(mktemp)
+        trap "rm -f $STOP_STATUS" EXIT
+        for attempt in $(seq 1 30); do
+          echo "ok" > "$STOP_STATUS"
+          echo "$VMS" | while read node vmid name status; do
+            s=$(curl -sk \
+              -H "Authorization: {{.PVE_AUTH}}" \
+              "https://$node.{{.DOMAIN}}:8006/api2/json/nodes/$node/qemu/$vmid/status/current" \
+              | jq -r '.data.status // "stopped"')
+            if [ "$s" != "stopped" ]; then
+              echo "waiting" > "$STOP_STATUS"
+            fi
+          done
+          [ "$(cat "$STOP_STATUS")" = "ok" ] && break
+          sleep 2
+        done
+        rm -f "$STOP_STATUS"
+
+        # Delete all VMs
+        echo ""
+        echo "=== Deleting VMs ==="
+        echo "$VMS" | while read node vmid name status; do
+          echo "  Deleting $name ($vmid) on $node..."
+          curl -sk -X DELETE \
+            -H "Authorization: {{.PVE_AUTH}}" \
+            "https://$node.{{.DOMAIN}}:8006/api2/json/nodes/$node/qemu/$vmid?purge=1&destroy-unreferenced-disks=1" > /dev/null
+        done
+
+        echo ""
+        echo "Teardown complete for profile {{.PROFILE}}"
+
+  # ---------------------------------------------------------------------------
+  # Talos Linux Operations
+  # ---------------------------------------------------------------------------
+
+  talos:health:
+    desc: Check Talos cluster health
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        talosctl health
+
+  talos:status:
+    desc: Show Talos cluster members and Kubernetes nodes
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        echo "=== Talos Members ==="
+        talosctl get members
+        echo ""
+        echo "=== Kubernetes Nodes ==="
+        kubectl get nodes -o wide
+
+  talos:gen:secrets:
+    desc: Generate Talos cluster secrets
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        SECRETS_FILE=$(yq '.talos.secrets_file // "secrets.yaml"' "$PROFILE_FILE")
+
+        mkdir -p "$CONFIG_DIR"
+
+        if [ -f "${CONFIG_DIR}/${SECRETS_FILE}" ]; then
+          echo "Secrets file already exists: ${CONFIG_DIR}/${SECRETS_FILE}"
+          echo "Delete it first if you want to regenerate"
+          exit 1
+        fi
+
+        echo "Generating secrets at ${CONFIG_DIR}/${SECRETS_FILE}..."
+        talosctl gen secrets -o "${CONFIG_DIR}/${SECRETS_FILE}"
+        echo "Done. Store this file securely."
+
+  talos:gen:config:
+    desc: Generate Talos machine configs from cluster profile
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CLUSTER_NAME=$(yq '.name' "$PROFILE_FILE")
+        API_ENDPOINT=$(yq '.network.api_endpoint' "$PROFILE_FILE")
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        SECRETS_FILE=$(yq '.talos.secrets_file // "secrets.yaml"' "$PROFILE_FILE")
+        TALOS_VERSION=$(yq '.talos.version' "$PROFILE_FILE")
+        K8S_VERSION=$(yq '.talos.kubernetes_version // "1.32.0"' "$PROFILE_FILE")
+        SCHEMATIC_ID=$(yq '.talos.factory.schematic_id // ""' "$PROFILE_FILE")
+        POD_CIDR=$(yq '.network.pod_cidr' "$PROFILE_FILE")
+        SERVICE_CIDR=$(yq '.network.service_cidr' "$PROFILE_FILE")
+
+        if [ ! -f "${CONFIG_DIR}/${SECRETS_FILE}" ]; then
+          echo "Secrets file not found: ${CONFIG_DIR}/${SECRETS_FILE}"
+          echo "Run 'task talos:gen:secrets PROFILE={{.PROFILE}}' first"
+          exit 1
+        fi
+
+        INSTALLER_ARGS=""
+        if [ -n "$SCHEMATIC_ID" ]; then
+          INSTALLER_ARGS="--install-image factory.talos.dev/installer/${SCHEMATIC_ID}:v${TALOS_VERSION}"
+        fi
+
+        echo "Generating configs for cluster '$CLUSTER_NAME'..."
+        talosctl gen config "$CLUSTER_NAME" "https://${API_ENDPOINT}:6443" \
+          --output-dir "$CONFIG_DIR" \
+          --with-secrets "${CONFIG_DIR}/${SECRETS_FILE}" \
+          $INSTALLER_ARGS \
+          --kubernetes-version "$K8S_VERSION" \
+          --with-cluster-discovery=false \
+          --force \
+          --config-patch "[
+            {\"op\": \"add\", \"path\": \"/cluster/network/podSubnets\", \"value\": [\"${POD_CIDR}\"]},
+            {\"op\": \"add\", \"path\": \"/cluster/network/serviceSubnets\", \"value\": [\"${SERVICE_CIDR}\"]}
+          ]"
+        echo "Generated: controlplane.yaml, worker.yaml, talosconfig"
+
+  talos:apply:
+    desc: Apply Talos configs to all nodes (--insecure for first apply)
+    silent: true
+    requires:
+      vars: [PROFILE]
+    vars:
+      INSECURE: '{{.INSECURE | default "true"}}'
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        PATCHES_DIR=$(yq '.talos.patches_dir // "patches/"' "$PROFILE_FILE")
+
+        INSECURE_FLAG=""
+        if [ "{{.INSECURE}}" = "true" ]; then
+          INSECURE_FLAG="--insecure"
+        fi
+
+        # Apply to control plane nodes
+        CP_COUNT=$(yq '.nodes.controlplane.count' "$PROFILE_FILE")
+        for i in $(seq 0 $((CP_COUNT - 1))); do
+          NAME=$(yq ".nodes.controlplane.assignments[$i].name" "$PROFILE_FILE")
+          IP=$(yq ".nodes.controlplane.assignments[$i].ip" "$PROFILE_FILE")
+
+          PATCH_FILE="${CONFIG_DIR}/${PATCHES_DIR}/${NAME}.yaml"
+          PATCH_ARGS=""
+          if [ -f "$PATCH_FILE" ]; then
+            PATCH_ARGS="--config-patch @${PATCH_FILE}"
+          fi
+
+          echo "Applying controlplane config to $NAME ($IP)..."
+          talosctl apply-config $INSECURE_FLAG \
+            --nodes "$IP" \
+            --file "${CONFIG_DIR}/controlplane.yaml" \
+            $PATCH_ARGS
+        done
+
+        # Apply to worker nodes
+        W_COUNT=$(yq '.nodes.workers.count' "$PROFILE_FILE")
+        if [ "$W_COUNT" -gt 0 ]; then
+          for i in $(seq 0 $((W_COUNT - 1))); do
+            NAME=$(yq ".nodes.workers.assignments[$i].name" "$PROFILE_FILE")
+            IP=$(yq ".nodes.workers.assignments[$i].ip" "$PROFILE_FILE")
+
+            PATCH_FILE="${CONFIG_DIR}/${PATCHES_DIR}/${NAME}.yaml"
+            PATCH_ARGS=""
+            if [ -f "$PATCH_FILE" ]; then
+              PATCH_ARGS="--config-patch @${PATCH_FILE}"
+            fi
+
+            echo "Applying worker config to $NAME ($IP)..."
+            talosctl apply-config $INSECURE_FLAG \
+              --nodes "$IP" \
+              --file "${CONFIG_DIR}/worker.yaml" \
+              $PATCH_ARGS
+          done
+        fi
+        echo "Config application complete"
+
+  talos:bootstrap:
+    desc: Bootstrap etcd on the first control plane node
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        FIRST_CP_IP=$(yq '.nodes.controlplane.assignments[0].ip' "$PROFILE_FILE")
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        echo "Bootstrapping etcd on $FIRST_CP_IP..."
+        talosctl bootstrap \
+          --nodes "$FIRST_CP_IP" \
+          --endpoints "$FIRST_CP_IP"
+        echo "Bootstrap initiated. Waiting for cluster health..."
+        talosctl health --wait-timeout 10m \
+          --nodes "$FIRST_CP_IP" \
+          --endpoints "$FIRST_CP_IP"
+        echo "Cluster healthy"
+
+  talos:kubeconfig:
+    desc: Retrieve kubeconfig from the cluster
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        FIRST_CP_IP=$(yq '.nodes.controlplane.assignments[0].ip' "$PROFILE_FILE")
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        echo "Retrieving kubeconfig from $FIRST_CP_IP..."
+        talosctl kubeconfig \
+          --nodes "$FIRST_CP_IP" \
+          --endpoints "$FIRST_CP_IP" \
+          --force
+        echo "Kubeconfig merged into ~/.kube/config"
+
+  talos:upgrade:k8s:
+    desc: Upgrade Kubernetes version across the cluster
+    silent: true
+    requires:
+      vars: [PROFILE, VERSION]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        FIRST_CP_IP=$(yq '.nodes.controlplane.assignments[0].ip' "$PROFILE_FILE")
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        echo "Current versions:"
+        kubectl version --short 2>/dev/null || kubectl version
+        echo ""
+        echo "Upgrading Kubernetes to {{.VERSION}}..."
+        talosctl upgrade-k8s \
+          --to "{{.VERSION}}" \
+          --nodes "$FIRST_CP_IP" \
+          --endpoints "$FIRST_CP_IP"
+        echo ""
+        echo "Upgrade complete. Verifying..."
+        kubectl get nodes -o wide
+
+  talos:upgrade:os:
+    desc: Upgrade Talos OS on a single node
+    silent: true
+    requires:
+      vars: [PROFILE, NODE_IP, VERSION]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        SCHEMATIC_ID=$(yq '.talos.factory.schematic_id // ""' "$PROFILE_FILE")
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        if [ -z "$SCHEMATIC_ID" ]; then
+          echo "No schematic_id in profile -- using default Talos installer"
+          INSTALLER="ghcr.io/siderolabs/installer:v{{.VERSION}}"
+        else
+          INSTALLER="factory.talos.dev/installer/${SCHEMATIC_ID}:v{{.VERSION}}"
+        fi
+
+        echo "Upgrading Talos on {{.NODE_IP}} to v{{.VERSION}}..."
+        echo "Installer: $INSTALLER"
+        talosctl upgrade \
+          --nodes "{{.NODE_IP}}" \
+          --image "$INSTALLER" \
+          --preserve
+        echo ""
+        echo "Upgrade initiated. Waiting for node to rejoin..."
+        until talosctl --nodes "{{.NODE_IP}}" --endpoints "{{.NODE_IP}}" version >/dev/null 2>&1; do
+          sleep 10
+        done
+        echo "Node {{.NODE_IP}} is back"
+        echo ""
+        talosctl version --nodes "{{.NODE_IP}}"
+
+  talos:etcd:snapshot:
+    desc: Create an etcd snapshot
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        FIRST_CP_IP=$(yq '.nodes.controlplane.assignments[0].ip' "$PROFILE_FILE")
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        SNAPSHOT_DIR="${CONFIG_DIR}/etcd-backups"
+        mkdir -p "$SNAPSHOT_DIR"
+        SNAPSHOT="${SNAPSHOT_DIR}/etcd-$(date +%Y%m%d-%H%M%S).snapshot"
+
+        echo "Creating etcd snapshot from $FIRST_CP_IP..."
+        talosctl etcd snapshot "$SNAPSHOT" --nodes "$FIRST_CP_IP"
+
+        if [ -s "$SNAPSHOT" ]; then
+          echo "Snapshot created: $SNAPSHOT ($(du -h "$SNAPSHOT" | cut -f1))"
+        else
+          echo "ERROR: Snapshot is empty or failed"
+          rm -f "$SNAPSHOT"
+          exit 1
+        fi
+
+  talos:dashboard:
+    desc: Launch the Talos cluster dashboard (TUI)
+    silent: true
+    requires:
+      vars: [PROFILE]
+    cmds:
+      - |
+        PROFILE_FILE="{{.SKILL_DIR}}/clusters/{{.PROFILE}}.yaml"
+        if [ ! -f "$PROFILE_FILE" ]; then
+          echo "Profile not found: $PROFILE_FILE"
+          exit 1
+        fi
+
+        CONFIG_DIR=$(yq '.talos.config_dir' "$PROFILE_FILE")
+        CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+        export TALOSCONFIG="${CONFIG_DIR}/talosconfig"
+
+        talosctl dashboard
